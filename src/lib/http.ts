@@ -55,8 +55,12 @@ export async function request<T>(
   try {
     res = await fetch(url, {
       method: init?.method ?? "GET",
-      headers: init?.body ? { "content-type": "application/json" } : undefined,
-      body: init?.body ? JSON.stringify(init.body) : undefined,
+      ...(init?.body !== undefined
+        ? {
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify(init.body),
+          }
+        : {}),
       ...(init?.signal ? { signal: init.signal } : {}),
     });
   } catch {
