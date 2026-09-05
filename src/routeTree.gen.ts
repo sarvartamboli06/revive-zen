@@ -10,33 +10,154 @@
 
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as IndexRouteImport } from './routes/index'
+import { Route as AnalyticsRouteImport } from './routes/analytics'
+import { Route as AuditRouteImport } from './routes/audit'
+import { Route as CustomersRouteImport } from './routes/customers'
+import { Route as DashboardRouteImport } from './routes/dashboard'
+import { Route as RevenueAtRiskRouteImport } from './routes/revenue-at-risk'
+import { Route as SettingsRouteImport } from './routes/settings'
+import { Route as TransactionsRouteImport } from './routes/transactions'
+import { Route as CasesIndexRouteImport } from './routes/cases.index'
+import { Route as CasesCaseIdRouteImport } from './routes/cases.$caseId'
 
 const IndexRoute = IndexRouteImport.update({
   id: '/',
   path: '/',
   getParentRoute: () => rootRouteImport,
 } as any)
+const AnalyticsRoute = AnalyticsRouteImport.update({
+  id: '/analytics',
+  path: '/analytics',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const AuditRoute = AuditRouteImport.update({
+  id: '/audit',
+  path: '/audit',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const CustomersRoute = CustomersRouteImport.update({
+  id: '/customers',
+  path: '/customers',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const DashboardRoute = DashboardRouteImport.update({
+  id: '/dashboard',
+  path: '/dashboard',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const RevenueAtRiskRoute = RevenueAtRiskRouteImport.update({
+  id: '/revenue-at-risk',
+  path: '/revenue-at-risk',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const SettingsRoute = SettingsRouteImport.update({
+  id: '/settings',
+  path: '/settings',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const TransactionsRoute = TransactionsRouteImport.update({
+  id: '/transactions',
+  path: '/transactions',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const CasesIndexRoute = CasesIndexRouteImport.update({
+  id: '/cases/',
+  path: '/cases/',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const CasesCaseIdRoute = CasesCaseIdRouteImport.update({
+  id: '/cases/$caseId',
+  path: '/cases/$caseId',
+  getParentRoute: () => rootRouteImport,
+} as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
+  '/analytics': typeof AnalyticsRoute
+  '/audit': typeof AuditRoute
+  '/customers': typeof CustomersRoute
+  '/dashboard': typeof DashboardRoute
+  '/revenue-at-risk': typeof RevenueAtRiskRoute
+  '/settings': typeof SettingsRoute
+  '/transactions': typeof TransactionsRoute
+  '/cases/$caseId': typeof CasesCaseIdRoute
+  '/cases/': typeof CasesIndexRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
+  '/analytics': typeof AnalyticsRoute
+  '/audit': typeof AuditRoute
+  '/customers': typeof CustomersRoute
+  '/dashboard': typeof DashboardRoute
+  '/revenue-at-risk': typeof RevenueAtRiskRoute
+  '/settings': typeof SettingsRoute
+  '/transactions': typeof TransactionsRoute
+  '/cases/$caseId': typeof CasesCaseIdRoute
+  '/cases': typeof CasesIndexRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
+  '/analytics': typeof AnalyticsRoute
+  '/audit': typeof AuditRoute
+  '/customers': typeof CustomersRoute
+  '/dashboard': typeof DashboardRoute
+  '/revenue-at-risk': typeof RevenueAtRiskRoute
+  '/settings': typeof SettingsRoute
+  '/transactions': typeof TransactionsRoute
+  '/cases/$caseId': typeof CasesCaseIdRoute
+  '/cases/': typeof CasesIndexRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
-  fullPaths: '/'
+  fullPaths:
+    | '/'
+    | '/analytics'
+    | '/audit'
+    | '/customers'
+    | '/dashboard'
+    | '/revenue-at-risk'
+    | '/settings'
+    | '/transactions'
+    | '/cases/$caseId'
+    | '/cases/'
   fileRoutesByTo: FileRoutesByTo
-  to: '/'
-  id: '__root__' | '/'
+  to:
+    | '/'
+    | '/analytics'
+    | '/audit'
+    | '/customers'
+    | '/dashboard'
+    | '/revenue-at-risk'
+    | '/settings'
+    | '/transactions'
+    | '/cases/$caseId'
+    | '/cases'
+  id:
+    | '__root__'
+    | '/'
+    | '/analytics'
+    | '/audit'
+    | '/customers'
+    | '/dashboard'
+    | '/revenue-at-risk'
+    | '/settings'
+    | '/transactions'
+    | '/cases/$caseId'
+    | '/cases/'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
+  AnalyticsRoute: typeof AnalyticsRoute
+  AuditRoute: typeof AuditRoute
+  CustomersRoute: typeof CustomersRoute
+  DashboardRoute: typeof DashboardRoute
+  RevenueAtRiskRoute: typeof RevenueAtRiskRoute
+  SettingsRoute: typeof SettingsRoute
+  TransactionsRoute: typeof TransactionsRoute
+  CasesCaseIdRoute: typeof CasesCaseIdRoute
+  CasesIndexRoute: typeof CasesIndexRoute
 }
 
 declare module '@tanstack/react-router' {
@@ -48,11 +169,83 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof IndexRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/analytics': {
+      id: '/analytics'
+      path: '/analytics'
+      fullPath: '/analytics'
+      preLoaderRoute: typeof AnalyticsRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/audit': {
+      id: '/audit'
+      path: '/audit'
+      fullPath: '/audit'
+      preLoaderRoute: typeof AuditRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/customers': {
+      id: '/customers'
+      path: '/customers'
+      fullPath: '/customers'
+      preLoaderRoute: typeof CustomersRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/dashboard': {
+      id: '/dashboard'
+      path: '/dashboard'
+      fullPath: '/dashboard'
+      preLoaderRoute: typeof DashboardRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/revenue-at-risk': {
+      id: '/revenue-at-risk'
+      path: '/revenue-at-risk'
+      fullPath: '/revenue-at-risk'
+      preLoaderRoute: typeof RevenueAtRiskRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/settings': {
+      id: '/settings'
+      path: '/settings'
+      fullPath: '/settings'
+      preLoaderRoute: typeof SettingsRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/transactions': {
+      id: '/transactions'
+      path: '/transactions'
+      fullPath: '/transactions'
+      preLoaderRoute: typeof TransactionsRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/cases/': {
+      id: '/cases/'
+      path: '/cases'
+      fullPath: '/cases/'
+      preLoaderRoute: typeof CasesIndexRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/cases/$caseId': {
+      id: '/cases/$caseId'
+      path: '/cases/$caseId'
+      fullPath: '/cases/$caseId'
+      preLoaderRoute: typeof CasesCaseIdRouteImport
+      parentRoute: typeof rootRouteImport
+    }
   }
 }
 
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
+  AnalyticsRoute: AnalyticsRoute,
+  AuditRoute: AuditRoute,
+  CustomersRoute: CustomersRoute,
+  DashboardRoute: DashboardRoute,
+  RevenueAtRiskRoute: RevenueAtRiskRoute,
+  SettingsRoute: SettingsRoute,
+  TransactionsRoute: TransactionsRoute,
+  CasesCaseIdRoute: CasesCaseIdRoute,
+  CasesIndexRoute: CasesIndexRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)
