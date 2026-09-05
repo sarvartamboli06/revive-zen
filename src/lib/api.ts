@@ -1,32 +1,27 @@
 /**
- * Mock API layer for RecoverAI.
+ * Centralised API service for RecoverAI.
  *
- * Every function here mirrors a future backend endpoint (FastAPI / Supabase):
+ * Every read/write goes through the FastAPI backend (default http://localhost:8000,
+ * override with VITE_API_BASE_URL):
  *
  *   GET  /api/dashboard
  *   GET  /api/transactions
+ *   GET  /api/customers
  *   GET  /api/recovery-cases
- *   POST /api/recovery-cases/:id/analyze
- *   POST /api/recovery-cases/:id/execute
- *   POST /api/recovery-cases/:id/escalate
- *   POST /api/recovery-cases/:id/stop
- *   POST /api/recovery-cases/:id/payment-link
+ *   GET  /api/recovery-cases/{case_id}
+ *   POST /api/recovery-cases/{case_id}/analyze
+ *   POST /api/recovery-cases/{case_id}/execute
+ *   POST /api/recovery-cases/{case_id}/payment-link
+ *   POST /api/recovery-cases/{case_id}/mark-recovered
+ *   POST /api/recovery-cases/{case_id}/escalate
+ *   POST /api/recovery-cases/{case_id}/stop
  *   GET  /api/audit
+ *   GET  /api/audit/{case_id}
  *
- * Swapping to a real backend only requires replacing the bodies below with
- * fetch() calls — the UI never touches raw data directly.
+ * Components never call fetch directly — they read the store below.
  */
-import {
-  auditTrail as seedAudit,
-  customers as seedCustomers,
-  defaultSettings,
-  failureReasonSeries,
-  methodSeries,
-  performanceSeries,
-  recoveryCases as seedCases,
-  recoveryRateSeries,
-  transactions as seedTransactions,
-} from "@/data/mock";
+import { defaultSettings } from "@/data/mock";
+import { api, ApiError } from "@/lib/http";
 import type {
   AuditEntry,
   Customer,
@@ -35,6 +30,8 @@ import type {
   Transaction,
 } from "@/lib/types";
 
+export { ApiError, API_BASE_URL } from "@/lib/http";
+
 export interface AppState {
   cases: RecoveryCase[];
   transactions: Transaction[];
@@ -42,23 +39,27 @@ export interface AppState {
   audit: AuditEntry[];
   settings: Settings;
   authenticated: boolean;
+  loading: boolean;
+  loaded: boolean;
+  error: string | null;
 }
 
-const clone = <T,>(value: T): T => JSON.parse(JSON.stringify(value)) as T;
-
 let state: AppState = {
-  cases: clone(seedCases),
-  transactions: clone(seedTransactions),
-  customers: clone(seedCustomers),
-  audit: clone(seedAudit),
+  cases: [],
+  transactions: [],
+  customers: [],
+  audit: [],
   settings: { ...defaultSettings },
   authenticated: false,
+  loading: false,
+  loaded: false,
+  error: null,
 };
 
 const listeners = new Set<() => void>();
 
-function commit(next: AppState) {
-  state = next;
+function commit(patch: Partial<AppState>) {
+  state = { ...state, ...patch };
   listeners.forEach((l) => l());
 }
 
@@ -71,29 +72,189 @@ export function getState() {
   return state;
 }
 
-const nowIso = () => new Date().toISOString();
-let auditSeq = 7800;
+export function errorMessage(error: unknown) {
+  if (error instanceof ApiError) return error.message;
+  if (error instanceof Error) return error.message;
+  return "Something went wrong. Please try again.";
+}
 
-function addAudit(
-  entry: Omit<AuditEntry, "id" | "timestamp"> & { timestamp?: string },
-): AuditEntry {
+/* ------------------------------------------------------------------ */
+/* Payload normalisation                                               */
+/* ------------------------------------------------------------------ */
+
+/** Backends return either a bare list or { items: [...] } / { data: [...] }. */
+function toList<T>(payload: unknown): T[] {
+  if (Array.isArray(payload)) return payload as T[];
+  if (payload && typeof payload === "object") {
+    for (const key of ["items", "data", "results", "cases", "transactions", "customers", "audit"]) {
+      const value = (payload as Record<string, unknown>)[key];
+      if (Array.isArray(value)) return value as T[];
+    }
+  }
+  return [];
+}
+
+function normalizeCase(raw: Record<string, unknown>): RecoveryCase {
+  const c = raw as unknown as RecoveryCase & Record<string, unknown>;
   return {
-    id: `AUD-${++auditSeq}`,
-    timestamp: entry.timestamp ?? nowIso(),
-    caseId: entry.caseId,
-    event: entry.event,
-    decision: entry.decision,
-    action: entry.action,
-    result: entry.result,
-    actor: entry.actor,
+    ...c,
+    id: String(c.id ?? (raw['caseId'] as string) ?? ""),
+    amount: Number(c.amount ?? 0),
+    probability: Number(c.probability ?? 0),
+    attempts: Number(c.attempts ?? 0),
+    contacts: Number(c.contacts ?? 0),
+    aiReasoning: Array.isArray(c.aiReasoning)
+      ? c.aiReasoning
+      : typeof c.aiReasoning === "string"
+        ? [c.aiReasoning]
+        : [],
+    timeline: Array.isArray(c.timeline) ? c.timeline : [],
+    createdAt: c.createdAt ?? new Date().toISOString(),
   };
 }
 
-function updateCase(id: string, updater: (c: RecoveryCase) => RecoveryCase, audit: AuditEntry[]) {
-  const cases = state.cases.map((c) => (c.id === id ? updater(c) : c));
-  commit({ ...state, cases, audit: [...audit, ...state.audit] });
-  return cases.find((c) => c.id === id)!;
+/** Actions may return the case itself, or { case: {...} } / { data: {...} }. */
+function extractCase(payload: unknown): RecoveryCase | null {
+  if (!payload || typeof payload !== "object") return null;
+  const obj = payload as Record<string, unknown>;
+  const inner = (obj['case'] ?? obj['recoveryCase'] ?? obj['data'] ?? obj) as Record<string, unknown>;
+  if (!inner || typeof inner !== "object" || !("id" in inner || "amount" in inner)) return null;
+  return normalizeCase(inner);
 }
+
+function mergeCase(updated: RecoveryCase) {
+  const exists = state.cases.some((c) => c.id === updated.id);
+  commit({
+    cases: exists
+      ? state.cases.map((c) => (c.id === updated.id ? updated : c))
+      : [updated, ...state.cases],
+  });
+  return updated;
+}
+
+/* ------------------------------------------------------------------ */
+/* Reads                                                               */
+/* ------------------------------------------------------------------ */
+
+export interface DashboardMetrics {
+  revenueAtRisk: number;
+  revenueRecovered: number;
+  recoveryRate: number;
+  activeCases: number;
+  customersRecovered: number;
+  escalatedCases: number;
+}
+
+let dashboard: DashboardMetrics | null = null;
+
+function computeDashboard(): DashboardMetrics {
+  const { cases } = state;
+  const recoveredCases = cases.filter((c) => c.status === "Recovered");
+  const atRiskCases = cases.filter((c) => c.status !== "Recovered" && c.status !== "Stopped");
+  const revenueAtRisk = atRiskCases.reduce((s, c) => s + c.amount, 0);
+  const revenueRecovered = recoveredCases.reduce((s, c) => s + c.amount, 0);
+  const total = revenueAtRisk + revenueRecovered;
+  return {
+    revenueAtRisk,
+    revenueRecovered,
+    recoveryRate: total ? Math.round((revenueRecovered / total) * 1000) / 10 : 0,
+    activeCases: atRiskCases.length,
+    customersRecovered: new Set(recoveredCases.map((c) => c.customerId)).size,
+    escalatedCases: cases.filter((c) => c.status === "Escalated").length,
+  };
+}
+
+/** Backend numbers win; anything the API omits is derived from the case list. */
+export function getDashboard(): DashboardMetrics {
+  const derived = computeDashboard();
+  if (!dashboard) return derived;
+  const pick = (value: number | undefined, fallback: number) =>
+    typeof value === "number" && Number.isFinite(value) ? value : fallback;
+  return {
+    revenueAtRisk: pick(dashboard.revenueAtRisk, derived.revenueAtRisk),
+    revenueRecovered: pick(dashboard.revenueRecovered, derived.revenueRecovered),
+    recoveryRate: pick(dashboard.recoveryRate, derived.recoveryRate),
+    activeCases: pick(dashboard.activeCases, derived.activeCases),
+    customersRecovered: pick(dashboard.customersRecovered, derived.customersRecovered),
+    escalatedCases: pick(dashboard.escalatedCases, derived.escalatedCases),
+  };
+}
+
+export const getTransactions = () => state.transactions;
+export const getRecoveryCases = () => state.cases;
+export const getCase = (id: string) => state.cases.find((c) => c.id === id);
+export const getCustomers = () => state.customers;
+export const getAudit = () => state.audit;
+export const getSettings = () => state.settings;
+
+/* ------------------------------------------------------------------ */
+/* Charts derived from live backend data                               */
+/* ------------------------------------------------------------------ */
+
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+function monthKey(iso: string) {
+  const d = new Date(iso);
+  return Number.isNaN(d.getTime()) ? "—" : `${MONTHS[d.getMonth()]}`;
+}
+
+function performanceSeries() {
+  const buckets = new Map<string, { month: string; atRisk: number; recovered: number }>();
+  for (const c of state.cases) {
+    const month = monthKey(c.createdAt);
+    const row = buckets.get(month) ?? { month, atRisk: 0, recovered: 0 };
+    if (c.status === "Recovered") row.recovered += c.amount;
+    else if (c.status !== "Stopped") row.atRisk += c.amount;
+    buckets.set(month, row);
+  }
+  return [...buckets.values()].sort((a, b) => MONTHS.indexOf(a.month) - MONTHS.indexOf(b.month));
+}
+
+function recoveryRateSeries() {
+  return performanceSeries().map((row) => {
+    const total = row.atRisk + row.recovered;
+    return { month: row.month, rate: total ? Math.round((row.recovered / total) * 1000) / 10 : 0 };
+  });
+}
+
+function failureReasonSeries() {
+  const buckets = new Map<string, { reason: string; recovered: number; lost: number }>();
+  for (const c of state.cases) {
+    const reason = c.failureReason || "Unknown";
+    const row = buckets.get(reason) ?? { reason, recovered: 0, lost: 0 };
+    if (c.status === "Recovered") row.recovered += c.amount;
+    else row.lost += c.amount;
+    buckets.set(reason, row);
+  }
+  return [...buckets.values()].sort((a, b) => b.recovered + b.lost - (a.recovered + a.lost));
+}
+
+function methodSeries() {
+  const buckets = new Map<string, number>();
+  for (const t of state.transactions) {
+    buckets.set(t.method, (buckets.get(t.method) ?? 0) + 1);
+  }
+  const total = [...buckets.values()].reduce((s, v) => s + v, 0);
+  if (!total) return [];
+  return [...buckets.entries()]
+    .map(([name, count]) => ({ name, value: Math.round((count / total) * 100) }))
+    .sort((a, b) => b.value - a.value);
+}
+
+export const charts = {
+  get performanceSeries() {
+    return performanceSeries();
+  },
+  get recoveryRateSeries() {
+    return recoveryRateSeries();
+  },
+  get failureReasonSeries() {
+    return failureReasonSeries();
+  },
+  get methodSeries() {
+    return methodSeries();
+  },
+};
 
 /* ------------------------------------------------------------------ */
 /* Guardrails                                                          */
@@ -157,98 +318,6 @@ export function evaluateGuardrails(c: RecoveryCase, settings: Settings): Guardra
   };
 }
 
-/* ------------------------------------------------------------------ */
-/* Reads                                                               */
-/* ------------------------------------------------------------------ */
-
-export interface DashboardMetrics {
-  revenueAtRisk: number;
-  revenueRecovered: number;
-  recoveryRate: number;
-  activeCases: number;
-  customersRecovered: number;
-  escalatedCases: number;
-}
-
-export function getDashboard(): DashboardMetrics {
-  const { cases } = state;
-  const recoveredCases = cases.filter((c) => c.status === "Recovered");
-  const atRiskCases = cases.filter(
-    (c) => c.status !== "Recovered" && c.status !== "Stopped",
-  );
-  const revenueAtRisk = atRiskCases.reduce((s, c) => s + c.amount, 0);
-  const revenueRecovered = recoveredCases.reduce((s, c) => s + c.amount, 0);
-  const total = revenueAtRisk + revenueRecovered;
-  return {
-    revenueAtRisk,
-    revenueRecovered,
-    recoveryRate: total ? Math.round((revenueRecovered / total) * 1000) / 10 : 0,
-    activeCases: atRiskCases.length,
-    customersRecovered: new Set(recoveredCases.map((c) => c.customerId)).size,
-    escalatedCases: cases.filter((c) => c.status === "Escalated").length,
-  };
-}
-
-export const getTransactions = () => state.transactions;
-export const getRecoveryCases = () => state.cases;
-export const getCase = (id: string) => state.cases.find((c) => c.id === id);
-export const getCustomers = () => state.customers;
-export const getAudit = () => state.audit;
-export const getSettings = () => state.settings;
-export const charts = {
-  performanceSeries,
-  recoveryRateSeries,
-  failureReasonSeries,
-  methodSeries,
-};
-
-/* ------------------------------------------------------------------ */
-/* Writes                                                              */
-/* ------------------------------------------------------------------ */
-
-export function login() {
-  commit({ ...state, authenticated: true });
-}
-
-export function logout() {
-  commit({ ...state, authenticated: false });
-}
-
-export function updateSettings(patch: Partial<Settings>) {
-  commit({ ...state, settings: { ...state.settings, ...patch } });
-}
-
-function buildReasoning(c: RecoveryCase, settings: Settings) {
-  const customer = state.customers.find((x) => x.id === c.customerId);
-  const reasoning: string[] = [];
-  reasoning.push(
-    `The payment of ${formatINR(c.amount)} failed because of: ${c.failureReason.toLowerCase()}.`,
-  );
-  if (customer) {
-    reasoning.push(
-      `${customer.name} has completed ${customer.totalPayments} payments before, with ${customer.failedPayments} failures — this is a ${customer.failedPayments <= 3 ? "reliable" : "moderately risky"} payer.`,
-    );
-  }
-  if (c.problem === "Checkout Abandoned") {
-    reasoning.push("The customer left at the payment step, so a gentle reminder usually works.");
-  } else if (c.problem === "Repeated Failure") {
-    reasoning.push("The same payment has failed more than once, so another silent retry is unlikely to work.");
-  } else {
-    reasoning.push("This looks like a one-off failure that a fresh payment link can fix.");
-  }
-  if (c.amount > settings.highValueThreshold) {
-    reasoning.push(
-      `The amount is above the high-value limit of ${formatINR(settings.highValueThreshold)}, so a human must approve any recovery action.`,
-    );
-  }
-  if (c.attempts >= settings.maxAttempts) {
-    reasoning.push(
-      `${c.attempts} of ${settings.maxAttempts} attempts have already been used, so automatic recovery is switched off.`,
-    );
-  }
-  return reasoning;
-}
-
 export function formatINR(amount: number) {
   return new Intl.NumberFormat("en-IN", {
     style: "currency",
@@ -257,270 +326,118 @@ export function formatINR(amount: number) {
   }).format(amount);
 }
 
-export async function analyzeCase(id: string) {
-  const current = getCase(id);
-  if (!current) throw new Error("Case not found");
-  await delay(900);
-  const settings = state.settings;
-  const reasoning = buildReasoning(current, settings);
+/* ------------------------------------------------------------------ */
+/* Loading                                                             */
+/* ------------------------------------------------------------------ */
 
-  let decision: RecoveryCase["aiDecision"] = "Auto Recovery Approved";
-  let action: RecoveryCase["recommendedAction"] = "Send Smart Payment Link";
-  let status: RecoveryCase["status"] = "Analyzed";
-
-  if (current.attempts >= settings.maxAttempts) {
-    decision = "Recovery Blocked";
-    action = "Stop Recovery";
-    status = "Stopped";
-  } else if (current.amount > settings.highValueThreshold) {
-    decision = "Human Review Required";
-    action = "Escalate to Human Review";
-  } else if (current.probability < settings.aiConfidenceThreshold) {
-    decision = "Human Review Required";
-    action = "Escalate to Human Review";
-  } else if (current.problem === "Checkout Abandoned") {
-    action = "Send Checkout Reminder";
-  } else if (current.failureReason.toLowerCase().includes("3d secure")) {
-    action = "Retry Payment on Backup Method";
+async function safe<T>(promise: Promise<T>, fallback: T, errors: string[]): Promise<T> {
+  try {
+    return await promise;
+  } catch (error) {
+    errors.push(errorMessage(error));
+    return fallback;
   }
-
-  return updateCase(
-    id,
-    (c) => ({
-      ...c,
-      status: c.status === "Recovered" ? c.status : status,
-      aiDecision: decision,
-      aiReasoning: reasoning,
-      recommendedAction: action,
-      timeline: [
-        ...c.timeline,
-        {
-          at: nowIso(),
-          label: "AI Analysed",
-          detail: `Recovery probability ${c.probability}% — ${decision}.`,
-          kind: "ai" as const,
-        },
-      ],
-    }),
-    [
-      addAudit({
-        caseId: id,
-        event: "AI Analysed",
-        decision,
-        action,
-        result: `Probability ${current.probability}%`,
-        actor: "AI Agent",
-      }),
-    ],
-  );
 }
 
-export async function generatePaymentLink(id: string) {
-  const current = getCase(id);
-  if (!current) throw new Error("Case not found");
-  await delay(700);
-  const link = `https://pay.recoverai.in/${id.toLowerCase()}-${Math.random().toString(36).slice(2, 8)}`;
-  return updateCase(
-    id,
-    (c) => ({
-      ...c,
-      paymentLink: link,
-      contacts: c.contacts + 1,
-      status: c.status === "Recovered" ? c.status : "Recovery Initiated",
-      timeline: [
-        ...c.timeline,
-        {
-          at: nowIso(),
-          label: "Payment Link Generated",
-          detail: "Smart payment link sent to the customer on email and SMS.",
-          kind: "ai" as const,
-        },
-      ],
-    }),
-    [
-      addAudit({
-        caseId: id,
-        event: "Recovery Link Generated",
-        decision: current.aiDecision,
-        action: "Send Smart Payment Link",
-        result: "Link delivered to customer",
-        actor: "AI Agent",
-      }),
-    ],
-  );
-}
+/** Fetch everything the app needs. Called on mount and by the refresh button. */
+export async function loadAll() {
+  commit({ loading: true, error: null });
+  const errors: string[] = [];
+  const [dash, cases, transactions, customers, audit] = await Promise.all([
+    safe(api.get<DashboardMetrics>("/api/dashboard"), null as DashboardMetrics | null, errors),
+    safe(api.get<unknown>("/api/recovery-cases"), null, errors),
+    safe(api.get<unknown>("/api/transactions"), null, errors),
+    safe(api.get<unknown>("/api/customers"), null, errors),
+    safe(api.get<unknown>("/api/audit"), null, errors),
+  ]);
 
-export async function executeRecovery(id: string) {
-  const current = getCase(id);
-  if (!current) throw new Error("Case not found");
-  const guard = evaluateGuardrails(current, state.settings);
-  if (guard.recoveryDisabled) {
-    throw new Error(guard.reasons[0] ?? "Recovery is not allowed for this case.");
-  }
-  await delay(900);
-  const attempts = current.attempts + 1;
-  const limitHit = attempts >= state.settings.maxAttempts;
-  return updateCase(
-    id,
-    (c) => ({
-      ...c,
-      attempts,
-      contacts: c.contacts + 1,
-      status: limitHit ? "Stopped" : "Recovery Initiated",
-      timeline: [
-        ...c.timeline,
-        {
-          at: nowIso(),
-          label: `Recovery Attempt ${attempts}`,
-          detail: `${c.recommendedAction} executed automatically.`,
-          kind: "ai" as const,
-        },
-        ...(limitHit
-          ? [
-              {
-                at: nowIso(),
-                label: "Recovery Stopped",
-                detail: `Attempt limit ${state.settings.maxAttempts}/${state.settings.maxAttempts} reached — automatic recovery disabled.`,
-                kind: "system" as const,
-              },
-            ]
-          : []),
-      ],
-    }),
-    [
-      addAudit({
-        caseId: id,
-        event: `Recovery Attempt ${attempts}`,
-        decision: current.aiDecision,
-        action: current.recommendedAction,
-        result: limitHit ? "Attempt limit reached — recovery stopped" : "Recovery initiated",
-        actor: "AI Agent",
-      }),
-    ],
-  );
-}
-
-export async function markRecovered(id: string) {
-  const current = getCase(id);
-  if (!current) throw new Error("Case not found");
-  await delay(800);
-  const transactions = state.transactions.map((t) =>
-    t.id === current.transactionId
-      ? { ...t, status: "Recovered" as const, recoveryStatus: "Recovered by RecoverAI" }
-      : t,
-  );
-  const customers = state.customers.map((cu) =>
-    cu.id === current.customerId
-      ? { ...cu, recoveredRevenue: cu.recoveredRevenue + current.amount }
-      : cu,
-  );
-  const cases = state.cases.map((c) =>
-    c.id === id
-      ? {
-          ...c,
-          status: "Recovered" as const,
-          timeline: [
-            ...c.timeline,
-            {
-              at: nowIso(),
-              label: "Payment Recovered",
-              detail: `${formatINR(c.amount)} collected and verified.`,
-              kind: "system" as const,
-            },
-          ],
-        }
-      : c,
-  );
+  dashboard = dash ?? dashboard;
   commit({
-    ...state,
-    cases,
-    transactions,
-    customers,
-    audit: [
-      addAudit({
-        caseId: id,
-        event: "Payment Recovered",
-        decision: current.aiDecision,
-        action: current.recommendedAction,
-        result: `${formatINR(current.amount)} recovered`,
-        actor: "System",
-      }),
-      ...state.audit,
-    ],
+    ...(cases ? { cases: toList<Record<string, unknown>>(cases).map(normalizeCase) } : {}),
+    ...(transactions ? { transactions: toList<Transaction>(transactions) } : {}),
+    ...(customers ? { customers: toList<Customer>(customers) } : {}),
+    ...(audit ? { audit: toList<AuditEntry>(audit) } : {}),
+    loading: false,
+    loaded: true,
+    error: errors[0] ?? null,
   });
-  return cases.find((c) => c.id === id)!;
+  if (errors.length) throw new ApiError(errors[0]!, 0);
 }
 
-export async function escalateCase(id: string, note?: string) {
-  const current = getCase(id);
-  if (!current) throw new Error("Case not found");
-  await delay(600);
-  return updateCase(
-    id,
-    (c) => ({
-      ...c,
-      status: "Escalated",
-      aiDecision: "Human Review Required",
-      timeline: [
-        ...c.timeline,
-        {
-          at: nowIso(),
-          label: "Escalated to Human Review",
-          detail: note?.trim() ? note.trim() : "Case handed to the revenue operations team.",
-          kind: "human" as const,
-        },
-      ],
-    }),
-    [
-      addAudit({
-        caseId: id,
-        event: "Escalated",
-        decision: "Human Review Required",
-        action: "Assign to revenue operations",
-        result: "Awaiting human decision",
-        actor: "Human",
-      }),
-    ],
-  );
-}
-
-export async function stopRecovery(id: string, reason?: string) {
-  const current = getCase(id);
-  if (!current) throw new Error("Case not found");
-  await delay(500);
-  return updateCase(
-    id,
-    (c) => ({
-      ...c,
-      status: "Stopped",
-      timeline: [
-        ...c.timeline,
-        {
-          at: nowIso(),
-          label: "Recovery Stopped",
-          detail: reason?.trim() ? reason.trim() : "Recovery stopped manually.",
-          kind: "human" as const,
-        },
-      ],
-    }),
-    [
-      addAudit({
-        caseId: id,
-        event: "Recovery Stopped",
-        decision: "Manual stop",
-        action: "Disable further attempts",
-        result: "No further contact",
-        actor: "Human",
-      }),
-    ],
-  );
+/** GET /api/recovery-cases/{case_id} plus its audit history. */
+export async function loadCase(id: string) {
+  const [detail, audit] = await Promise.all([
+    api.get<unknown>(`/api/recovery-cases/${encodeURIComponent(id)}`),
+    api
+      .get<unknown>(`/api/audit/${encodeURIComponent(id)}`)
+      .catch(() => null),
+  ]);
+  const updated = extractCase(detail);
+  if (updated) mergeCase(updated);
+  if (audit) {
+    const rows = toList<AuditEntry>(audit);
+    const others = state.audit.filter((a) => a.caseId !== id);
+    commit({ audit: [...rows, ...others] });
+  }
+  return updated;
 }
 
 export async function refreshData() {
-  await delay(600);
-  listeners.forEach((l) => l());
+  await loadAll();
 }
 
-function delay(ms: number) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+/* ------------------------------------------------------------------ */
+/* Writes                                                              */
+/* ------------------------------------------------------------------ */
+
+async function caseAction(id: string, path: string, body?: unknown) {
+  const payload = await api.post<unknown>(
+    `/api/recovery-cases/${encodeURIComponent(id)}/${path}`,
+    body,
+  );
+  const updated = extractCase(payload);
+  if (updated) mergeCase(updated);
+  // Keep dashboard totals and audit trail in sync after any state change.
+  void syncAfterAction(id);
+  return updated ?? getCase(id)!;
+}
+
+async function syncAfterAction(id: string) {
+  try {
+    const [dash, audit] = await Promise.all([
+      api.get<DashboardMetrics>("/api/dashboard").catch(() => null),
+      api.get<unknown>("/api/audit").catch(() => null),
+    ]);
+    if (dash) dashboard = dash;
+    if (audit) commit({ audit: toList<AuditEntry>(audit) });
+    else commit({});
+    await loadCase(id).catch(() => null);
+  } catch {
+    /* non-fatal background sync */
+  }
+}
+
+export const analyzeCase = (id: string) => caseAction(id, "analyze");
+export const executeRecovery = (id: string) => caseAction(id, "execute");
+export const generatePaymentLink = (id: string) => caseAction(id, "payment-link");
+export const markRecovered = (id: string) => caseAction(id, "mark-recovered");
+export const escalateCase = (id: string, note?: string) =>
+  caseAction(id, "escalate", note?.trim() ? { note: note.trim() } : undefined);
+export const stopRecovery = (id: string, reason?: string) =>
+  caseAction(id, "stop", reason?.trim() ? { reason: reason.trim() } : undefined);
+
+/* ------------------------------------------------------------------ */
+/* Local-only preferences                                              */
+/* ------------------------------------------------------------------ */
+
+export function login() {
+  commit({ authenticated: true });
+}
+
+export function logout() {
+  commit({ authenticated: false });
+}
+
+export function updateSettings(patch: Partial<Settings>) {
+  commit({ settings: { ...state.settings, ...patch } });
 }
