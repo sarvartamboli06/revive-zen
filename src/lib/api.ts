@@ -1,21 +1,27 @@
 /**
- * Real API layer for RecoverAI.
- * Connects directly to FastAPI backend (http://localhost:8000)
- * with robust local cache & fallback.
+ * Centralised API service for RecoverAI.
+ *
+ * Every read/write goes through the FastAPI backend (default http://localhost:8000,
+ * override with VITE_API_BASE_URL):
+ *
+ *   GET  /api/dashboard
+ *   GET  /api/transactions
+ *   GET  /api/customers
+ *   GET  /api/recovery-cases
+ *   GET  /api/recovery-cases/{case_id}
+ *   POST /api/recovery-cases/{case_id}/analyze
+ *   POST /api/recovery-cases/{case_id}/execute
+ *   POST /api/recovery-cases/{case_id}/payment-link
+ *   POST /api/recovery-cases/{case_id}/mark-recovered
+ *   POST /api/recovery-cases/{case_id}/escalate
+ *   POST /api/recovery-cases/{case_id}/stop
+ *   GET  /api/audit
+ *   GET  /api/audit/{case_id}
+ *
+ * Components never call fetch directly — they read the store below.
  */
-
-import {
-  auditTrail as seedAudit,
-  customers as seedCustomers,
-  defaultSettings,
-  failureReasonSeries,
-  methodSeries,
-  performanceSeries,
-  recoveryCases as seedCases,
-  recoveryRateSeries,
-  transactions as seedTransactions,
-} from "@/data/mock";
-import { apiClient } from "@/lib/api-client";
+import { defaultSettings } from "@/data/mock";
+import { api, ApiError } from "@/lib/http";
 import type {
   AuditEntry,
   Customer,
@@ -24,6 +30,8 @@ import type {
   Transaction,
 } from "@/lib/types";
 
+export { ApiError, API_BASE_URL } from "@/lib/http";
+
 export interface AppState {
   cases: RecoveryCase[];
   transactions: Transaction[];
@@ -31,25 +39,27 @@ export interface AppState {
   audit: AuditEntry[];
   settings: Settings;
   authenticated: boolean;
-  isBackendConnected: boolean;
+  loading: boolean;
+  loaded: boolean;
+  error: string | null;
 }
 
-const clone = <T,>(value: T): T => JSON.parse(JSON.stringify(value)) as T;
-
 let state: AppState = {
-  cases: clone(seedCases),
-  transactions: clone(seedTransactions),
-  customers: clone(seedCustomers),
-  audit: clone(seedAudit),
+  cases: [],
+  transactions: [],
+  customers: [],
+  audit: [],
   settings: { ...defaultSettings },
   authenticated: false,
-  isBackendConnected: false,
+  loading: false,
+  loaded: false,
+  error: null,
 };
 
 const listeners = new Set<() => void>();
 
-function commit(next: AppState) {
-  state = next;
+function commit(patch: Partial<AppState>) {
+  state = { ...state, ...patch };
   listeners.forEach((l) => l());
 }
 
@@ -62,138 +72,194 @@ export function getState() {
   return state;
 }
 
-// ----------------------------------------------------------------------
-// Backend Model Mappers
-// ----------------------------------------------------------------------
-function mapCase(c: any): RecoveryCase {
-  const caseId = c.case_id || c.caseId || c.id;
-  const rawTimeline = Array.isArray(c.timeline) ? c.timeline : [];
-  const timeline = rawTimeline.map((t: any) => ({
-    at: t.at || t.created_at || new Date().toISOString(),
-    label: t.label || t.event || "Event",
-    detail: t.detail || t.result || "",
-    kind: (t.kind === "ai" || t.kind === "human" || t.kind === "system" ? t.kind : "system") as "ai" | "human" | "system",
-  }));
-
-  const aiReasoning = Array.isArray(c.aiReasoning)
-    ? c.aiReasoning
-    : c.ai_reason
-      ? [c.ai_reason]
-      : [];
-
-  return {
-    id: caseId,
-    customerId: c.customer_id || c.customerId || "",
-    customerName: c.customer_name || c.customerName || "Customer",
-    transactionId: c.transaction_id || c.transactionId || "",
-    amount: Number(c.amount || 0),
-    problem: (c.problem_type || c.problem || "Payment Failed") as any,
-    failureReason: c.ai_reason || c.failureReason || c.failure_reason || "",
-    probability: Number(c.recovery_probability ?? c.probability ?? 0),
-    priority: (c.priority || "Medium") as any,
-    status: (c.status || "Detected") as any,
-    attempts: Number(c.attempts || 0),
-    contacts: Number(c.contacts || 0),
-    createdAt: c.created_at || c.createdAt || new Date().toISOString(),
-    method: c.method || c.payment_method || "Payment Link",
-    aiDecision: (c.ai_decision || c.aiDecision || "Pending Analysis") as any,
-    aiReasoning,
-    recommendedAction: (c.recommended_action || c.recommendedAction || "Send Smart Payment Link") as any,
-    paymentLink: c.payment_link || c.paymentLink || undefined,
-    timeline,
-  };
+export function errorMessage(error: unknown) {
+  if (error instanceof ApiError) return error.message;
+  if (error instanceof Error) return error.message;
+  return "Something went wrong. Please try again.";
 }
 
-function mapTransaction(tx: any): Transaction {
-  return {
-    id: tx.transaction_id || tx.id,
-    customerId: tx.customer_id || tx.customerId || "",
-    customerName: tx.customerName || tx.customer_name || "Unknown",
-    amount: Number(tx.amount || 0),
-    method: tx.payment_method || tx.method || "Card/UPI",
-    date: tx.created_at || tx.date || new Date().toISOString(),
-    status: (tx.status || "Failed") as any,
-    failureReason: tx.failure_reason || tx.failureReason || null,
-    recoveryStatus: tx.recovery_status || tx.recoveryStatus || "Not Started",
-  };
-}
+/* ------------------------------------------------------------------ */
+/* Payload normalisation                                               */
+/* ------------------------------------------------------------------ */
 
-function mapCustomer(cust: any): Customer {
-  return {
-    id: cust.id,
-    name: cust.name,
-    email: cust.email,
-    phone: cust.phone || "",
-    city: cust.city || "Mumbai",
-    segment: (cust.segment || "SMB") as any,
-    lifetimeValue: Number(cust.total_revenue || cust.lifetimeValue || 0),
-    totalPayments: Number(cust.total_transactions || cust.totalPayments || 0),
-    failedPayments: Number(cust.failed_payments || cust.failedPayments || 0),
-    recoveredRevenue: Number(cust.recovered_revenue || cust.recoveredRevenue || 0),
-  };
-}
-
-function mapAudit(a: any): AuditEntry {
-  return {
-    id: String(a.id || `AUD-${Math.random().toString(36).slice(2, 7)}`),
-    timestamp: a.created_at || a.timestamp || new Date().toISOString(),
-    caseId: a.case_id || a.caseId || "",
-    event: a.event || "",
-    decision: a.decision || "",
-    action: a.action || "",
-    result: a.result || "",
-    actor: (a.performed_by || a.actor || "AI Agent") as any,
-  };
-}
-
-// ----------------------------------------------------------------------
-// Backend Sync
-// ----------------------------------------------------------------------
-export async function syncWithBackend(): Promise<boolean> {
-  try {
-    const [casesRes, txRes, custRes, auditRes] = await Promise.all([
-      apiClient.getRecoveryCases(),
-      apiClient.getTransactions(),
-      apiClient.getCustomers(),
-      apiClient.getAuditLogs(),
-    ]);
-
-    const mappedCases = Array.isArray(casesRes) ? casesRes.map(mapCase) : state.cases;
-    const mappedTx = Array.isArray(txRes) ? txRes.map(mapTransaction) : state.transactions;
-    const mappedCust = Array.isArray(custRes) ? custRes.map(mapCustomer) : state.customers;
-    const mappedAudit = Array.isArray(auditRes) ? auditRes.map(mapAudit) : state.audit;
-
-    commit({
-      ...state,
-      cases: mappedCases,
-      transactions: mappedTx,
-      customers: mappedCust,
-      audit: mappedAudit,
-      isBackendConnected: true,
-    });
-    return true;
-  } catch (err) {
-    console.warn("[RecoverAI] Backend unreachable; using local cache/seed data.", err);
-    return false;
+/** Backends return either a bare list or { items: [...] } / { data: [...] }. */
+function toList<T>(payload: unknown): T[] {
+  if (Array.isArray(payload)) return payload as T[];
+  if (payload && typeof payload === "object") {
+    for (const key of ["items", "data", "results", "cases", "transactions", "customers", "audit"]) {
+      const value = (payload as Record<string, unknown>)[key];
+      if (Array.isArray(value)) return value as T[];
+    }
   }
+  return [];
 }
 
-// Auto-sync on client load and periodic poll for live webhooks
-if (typeof window !== "undefined") {
-  syncWithBackend();
-  // Poll every 3 seconds for live background webhook updates
-  setInterval(() => {
-    syncWithBackend();
-  }, 3000);
-  window.addEventListener("focus", () => {
-    syncWithBackend();
+function normalizeCase(raw: Record<string, unknown>): RecoveryCase {
+  const c = raw as unknown as RecoveryCase & Record<string, unknown>;
+  return {
+    ...c,
+    id: String(c.id ?? (raw['caseId'] as string) ?? ""),
+    amount: Number(c.amount ?? 0),
+    probability: Number(c.probability ?? 0),
+    attempts: Number(c.attempts ?? 0),
+    contacts: Number(c.contacts ?? 0),
+    aiReasoning: Array.isArray(c.aiReasoning)
+      ? c.aiReasoning
+      : typeof c.aiReasoning === "string"
+        ? [c.aiReasoning]
+        : [],
+    timeline: Array.isArray(c.timeline) ? c.timeline : [],
+    createdAt: c.createdAt ?? new Date().toISOString(),
+  };
+}
+
+/** Actions may return the case itself, or { case: {...} } / { data: {...} }. */
+function extractCase(payload: unknown): RecoveryCase | null {
+  if (!payload || typeof payload !== "object") return null;
+  const obj = payload as Record<string, unknown>;
+  const inner = (obj['case'] ?? obj['recoveryCase'] ?? obj['data'] ?? obj) as Record<string, unknown>;
+  if (!inner || typeof inner !== "object" || !("id" in inner || "amount" in inner)) return null;
+  return normalizeCase(inner);
+}
+
+function mergeCase(updated: RecoveryCase) {
+  const exists = state.cases.some((c) => c.id === updated.id);
+  commit({
+    cases: exists
+      ? state.cases.map((c) => (c.id === updated.id ? updated : c))
+      : [updated, ...state.cases],
+  });
+  return updated;
+}
+
+/* ------------------------------------------------------------------ */
+/* Reads                                                               */
+/* ------------------------------------------------------------------ */
+
+export interface DashboardMetrics {
+  revenueAtRisk: number;
+  revenueRecovered: number;
+  recoveryRate: number;
+  activeCases: number;
+  customersRecovered: number;
+  escalatedCases: number;
+}
+
+let dashboard: DashboardMetrics | null = null;
+
+function computeDashboard(): DashboardMetrics {
+  const { cases } = state;
+  const recoveredCases = cases.filter((c) => c.status === "Recovered");
+  const atRiskCases = cases.filter((c) => c.status !== "Recovered" && c.status !== "Stopped");
+  const revenueAtRisk = atRiskCases.reduce((s, c) => s + c.amount, 0);
+  const revenueRecovered = recoveredCases.reduce((s, c) => s + c.amount, 0);
+  const total = revenueAtRisk + revenueRecovered;
+  return {
+    revenueAtRisk,
+    revenueRecovered,
+    recoveryRate: total ? Math.round((revenueRecovered / total) * 1000) / 10 : 0,
+    activeCases: atRiskCases.length,
+    customersRecovered: new Set(recoveredCases.map((c) => c.customerId)).size,
+    escalatedCases: cases.filter((c) => c.status === "Escalated").length,
+  };
+}
+
+/** Backend numbers win; anything the API omits is derived from the case list. */
+export function getDashboard(): DashboardMetrics {
+  const derived = computeDashboard();
+  if (!dashboard) return derived;
+  const pick = (value: number | undefined, fallback: number) =>
+    typeof value === "number" && Number.isFinite(value) ? value : fallback;
+  return {
+    revenueAtRisk: pick(dashboard.revenueAtRisk, derived.revenueAtRisk),
+    revenueRecovered: pick(dashboard.revenueRecovered, derived.revenueRecovered),
+    recoveryRate: pick(dashboard.recoveryRate, derived.recoveryRate),
+    activeCases: pick(dashboard.activeCases, derived.activeCases),
+    customersRecovered: pick(dashboard.customersRecovered, derived.customersRecovered),
+    escalatedCases: pick(dashboard.escalatedCases, derived.escalatedCases),
+  };
+}
+
+export const getTransactions = () => state.transactions;
+export const getRecoveryCases = () => state.cases;
+export const getCase = (id: string) => state.cases.find((c) => c.id === id);
+export const getCustomers = () => state.customers;
+export const getAudit = () => state.audit;
+export const getSettings = () => state.settings;
+
+/* ------------------------------------------------------------------ */
+/* Charts derived from live backend data                               */
+/* ------------------------------------------------------------------ */
+
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+function monthKey(iso: string) {
+  const d = new Date(iso);
+  return Number.isNaN(d.getTime()) ? "—" : `${MONTHS[d.getMonth()]}`;
+}
+
+function performanceSeries() {
+  const buckets = new Map<string, { month: string; atRisk: number; recovered: number }>();
+  for (const c of state.cases) {
+    const month = monthKey(c.createdAt);
+    const row = buckets.get(month) ?? { month, atRisk: 0, recovered: 0 };
+    if (c.status === "Recovered") row.recovered += c.amount;
+    else if (c.status !== "Stopped") row.atRisk += c.amount;
+    buckets.set(month, row);
+  }
+  return [...buckets.values()].sort((a, b) => MONTHS.indexOf(a.month) - MONTHS.indexOf(b.month));
+}
+
+function recoveryRateSeries() {
+  return performanceSeries().map((row) => {
+    const total = row.atRisk + row.recovered;
+    return { month: row.month, rate: total ? Math.round((row.recovered / total) * 1000) / 10 : 0 };
   });
 }
 
+function failureReasonSeries() {
+  const buckets = new Map<string, { reason: string; recovered: number; lost: number }>();
+  for (const c of state.cases) {
+    const reason = c.failureReason || "Unknown";
+    const row = buckets.get(reason) ?? { reason, recovered: 0, lost: 0 };
+    if (c.status === "Recovered") row.recovered += c.amount;
+    else row.lost += c.amount;
+    buckets.set(reason, row);
+  }
+  return [...buckets.values()].sort((a, b) => b.recovered + b.lost - (a.recovered + a.lost));
+}
+
+function methodSeries() {
+  const buckets = new Map<string, number>();
+  for (const t of state.transactions) {
+    buckets.set(t.method, (buckets.get(t.method) ?? 0) + 1);
+  }
+  const total = [...buckets.values()].reduce((s, v) => s + v, 0);
+  if (!total) return [];
+  return [...buckets.entries()]
+    .map(([name, count]) => ({ name, value: Math.round((count / total) * 100) }))
+    .sort((a, b) => b.value - a.value);
+}
+
+export const charts = {
+  get performanceSeries() {
+    return performanceSeries();
+  },
+  get recoveryRateSeries() {
+    return recoveryRateSeries();
+  },
+  get failureReasonSeries() {
+    return failureReasonSeries();
+  },
+  get methodSeries() {
+    return methodSeries();
+  },
+};
 
 /* ------------------------------------------------------------------ */
 /* Guardrails                                                          */
 /* ------------------------------------------------------------------ */
+
 export interface GuardrailState {
   attemptsUsed: number;
   maxAttempts: number;
@@ -252,65 +318,6 @@ export function evaluateGuardrails(c: RecoveryCase, settings: Settings): Guardra
   };
 }
 
-/* ------------------------------------------------------------------ */
-/* Reads                                                               */
-/* ------------------------------------------------------------------ */
-export interface DashboardMetrics {
-  revenueAtRisk: number;
-  revenueRecovered: number;
-  recoveryRate: number;
-  activeCases: number;
-  customersRecovered: number;
-  escalatedCases: number;
-}
-
-export function getDashboard(): DashboardMetrics {
-  const { cases } = state;
-  const recoveredCases = cases.filter((c) => c.status === "Recovered");
-  const atRiskCases = cases.filter(
-    (c) => c.status !== "Recovered" && c.status !== "Stopped",
-  );
-  const revenueAtRisk = atRiskCases.reduce((s, c) => s + c.amount, 0);
-  const revenueRecovered = recoveredCases.reduce((s, c) => s + c.amount, 0);
-  const total = revenueAtRisk + revenueRecovered;
-  return {
-    revenueAtRisk,
-    revenueRecovered,
-    recoveryRate: total ? Math.round((revenueRecovered / total) * 1000) / 10 : 0,
-    activeCases: atRiskCases.length,
-    customersRecovered: new Set(recoveredCases.map((c) => c.customerId)).size,
-    escalatedCases: cases.filter((c) => c.status === "Escalated").length,
-  };
-}
-
-export const getTransactions = () => state.transactions;
-export const getRecoveryCases = () => state.cases;
-export const getCase = (id: string) => state.cases.find((c) => c.id === id);
-export const getCustomers = () => state.customers;
-export const getAudit = () => state.audit;
-export const getSettings = () => state.settings;
-export const charts = {
-  performanceSeries,
-  recoveryRateSeries,
-  failureReasonSeries,
-  methodSeries,
-};
-
-/* ------------------------------------------------------------------ */
-/* Writes & Actions connected to FastAPI Backend                      */
-/* ------------------------------------------------------------------ */
-export function login() {
-  commit({ ...state, authenticated: true });
-}
-
-export function logout() {
-  commit({ ...state, authenticated: false });
-}
-
-export function updateSettings(patch: Partial<Settings>) {
-  commit({ ...state, settings: { ...state.settings, ...patch } });
-}
-
 export function formatINR(amount: number) {
   return new Intl.NumberFormat("en-IN", {
     style: "currency",
@@ -319,80 +326,128 @@ export function formatINR(amount: number) {
   }).format(amount);
 }
 
-export async function analyzeCase(id: string): Promise<RecoveryCase> {
+/* ------------------------------------------------------------------ */
+/* Loading                                                             */
+/* ------------------------------------------------------------------ */
+
+async function safe<T>(promise: Promise<T>, fallback: T, errors: string[]): Promise<T> {
   try {
-    await apiClient.analyzeCase(id);
-    await syncWithBackend();
-  } catch (err) {
-    console.warn(`[API] analyzeCase fallback for ${id}:`, err);
+    return await promise;
+  } catch (error) {
+    errors.push(errorMessage(error));
+    return fallback;
   }
-  const current = getCase(id);
-  if (!current) throw new Error("Case not found");
-  return current;
 }
 
-export async function generatePaymentLink(id: string): Promise<RecoveryCase> {
-  try {
-    await apiClient.generatePaymentLink(id);
-    await syncWithBackend();
-  } catch (err) {
-    console.warn(`[API] generatePaymentLink fallback for ${id}:`, err);
-  }
-  const current = getCase(id);
-  if (!current) throw new Error("Case not found");
-  return current;
+/** Fetch everything the app needs. Called on mount and by the refresh button. */
+export async function loadAll() {
+  commit({ loading: true, error: null });
+  const errors: string[] = [];
+  const [dash, cases, transactions, customers, audit] = await Promise.all([
+    safe(api.get<DashboardMetrics>("/api/dashboard"), null as DashboardMetrics | null, errors),
+    safe(api.get<unknown>("/api/recovery-cases"), null, errors),
+    safe(api.get<unknown>("/api/transactions"), null, errors),
+    safe(api.get<unknown>("/api/customers"), null, errors),
+    safe(api.get<unknown>("/api/audit"), null, errors),
+  ]);
+
+  dashboard = dash ?? dashboard;
+  commit({
+    ...(cases ? { cases: toList<Record<string, unknown>>(cases).map(normalizeCase) } : {}),
+    ...(transactions ? { transactions: toList<Transaction>(transactions) } : {}),
+    ...(customers ? { customers: toList<Customer>(customers) } : {}),
+    ...(audit ? { audit: toList<AuditEntry>(audit) } : {}),
+    loading: false,
+    loaded: true,
+    error: errors[0] ?? null,
+  });
+  if (errors.length) throw new ApiError(errors[0]!, 0);
 }
 
-export async function executeRecovery(id: string): Promise<RecoveryCase> {
-  try {
-    await apiClient.executeRecovery(id);
-    await syncWithBackend();
-  } catch (err) {
-    console.warn(`[API] executeRecovery error for ${id}:`, err);
-    throw err;
+/** GET /api/recovery-cases/{case_id} plus its audit history. */
+export async function loadCase(id: string) {
+  const [detail, audit] = await Promise.all([
+    api.get<unknown>(`/api/recovery-cases/${encodeURIComponent(id)}`),
+    api
+      .get<unknown>(`/api/audit/${encodeURIComponent(id)}`)
+      .catch(() => null),
+  ]);
+  const updated = extractCase(detail);
+  if (updated) mergeCase(updated);
+  if (audit) {
+    const rows = toList<AuditEntry>(audit);
+    const others = state.audit.filter((a) => a.caseId !== id);
+    commit({ audit: [...rows, ...others] });
   }
-  const current = getCase(id);
-  if (!current) throw new Error("Case not found");
-  return current;
+  return updated;
 }
 
-export async function markRecovered(id: string): Promise<RecoveryCase> {
-  try {
-    await apiClient.markRecovered(id);
-    await syncWithBackend();
-  } catch (err) {
-    console.warn(`[API] markRecovered fallback for ${id}:`, err);
-  }
-  const current = getCase(id);
-  if (!current) throw new Error("Case not found");
-  return current;
+export async function refreshData() {
+  await loadAll();
 }
 
-export async function escalateCase(id: string, note?: string): Promise<RecoveryCase> {
-  try {
-    await apiClient.escalateCase(id, note);
-    await syncWithBackend();
-  } catch (err) {
-    console.warn(`[API] escalateCase fallback for ${id}:`, err);
-  }
-  const current = getCase(id);
-  if (!current) throw new Error("Case not found");
-  return current;
+/* ------------------------------------------------------------------ */
+/* Writes                                                              */
+/* ------------------------------------------------------------------ */
+
+async function caseAction(id: string, path: string, body?: unknown) {
+  const payload = await api.post<unknown>(
+    `/api/recovery-cases/${encodeURIComponent(id)}/${path}`,
+    body,
+  );
+  const updated = extractCase(payload);
+  if (updated) mergeCase(updated);
+  // Keep dashboard totals and audit trail in sync after any state change.
+  void syncAfterAction(id);
+  return updated ?? getCase(id)!;
 }
 
-export async function stopRecovery(id: string, reason?: string): Promise<RecoveryCase> {
+async function syncAfterAction(id: string) {
   try {
-    await apiClient.stopRecovery(id, reason);
-    await syncWithBackend();
-  } catch (err) {
-    console.warn(`[API] stopRecovery fallback for ${id}:`, err);
+    const [dash, audit] = await Promise.all([
+      api.get<DashboardMetrics>("/api/dashboard").catch(() => null),
+      api.get<unknown>("/api/audit").catch(() => null),
+    ]);
+    if (dash) dashboard = dash;
+    if (audit) commit({ audit: toList<AuditEntry>(audit) });
+    else commit({});
+    await loadCase(id).catch(() => null);
+  } catch {
+    /* non-fatal background sync */
   }
-  const current = getCase(id);
-  if (!current) throw new Error("Case not found");
-  return current;
 }
 
-export async function refreshData(): Promise<void> {
-  await syncWithBackend();
-  listeners.forEach((l) => l());
+export const analyzeCase = (id: string) => caseAction(id, "analyze");
+export const executeRecovery = (id: string) => caseAction(id, "execute");
+export const generatePaymentLink = (id: string) => caseAction(id, "payment-link");
+export const markRecovered = (id: string) => caseAction(id, "mark-recovered");
+export const escalateCase = (id: string, note?: string) =>
+  caseAction(id, "escalate", note?.trim() ? { note: note.trim() } : undefined);
+export const stopRecovery = (id: string, reason?: string) =>
+  caseAction(id, "stop", reason?.trim() ? { reason: reason.trim() } : undefined);
+
+/* ------------------------------------------------------------------ */
+/* Local-only preferences                                              */
+/* ------------------------------------------------------------------ */
+
+export function login() {
+  commit({ authenticated: true });
 }
+
+export function logout() {
+  commit({ authenticated: false });
+}
+
+export function updateSettings(patch: Partial<Settings>) {
+  commit({ settings: { ...state.settings, ...patch } });
+}
+
+if (typeof window !== "undefined") {
+  setInterval(() => {
+    void loadAll().catch(() => {});
+  }, 3000);
+  window.addEventListener("focus", () => {
+    void loadAll().catch(() => {});
+  });
+}
+
