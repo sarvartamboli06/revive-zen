@@ -271,7 +271,22 @@ export function AppShell({
             </div>
             {actions && <div className="flex flex-wrap gap-2">{actions}</div>}
           </div>
-          {children}
+          {state.error && (
+            <div className="mb-4 flex items-start gap-2 rounded-lg border border-destructive/30 bg-destructive/5 px-4 py-3 text-sm text-destructive">
+              <AlertTriangle className="mt-0.5 size-4 shrink-0" />
+              <div>
+                <p className="font-medium">Backend not reachable</p>
+                <p className="text-destructive/80">{state.error}</p>
+              </div>
+            </div>
+          )}
+          {state.loading && !state.loaded ? (
+            <div className="flex items-center gap-2 rounded-lg border border-border bg-card px-4 py-10 text-sm text-muted-foreground">
+              <RefreshCw className="size-4 animate-spin" /> Loading live recovery data…
+            </div>
+          ) : (
+            children
+          )}
         </main>
       </div>
     </div>
