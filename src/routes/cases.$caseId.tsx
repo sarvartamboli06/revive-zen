@@ -511,7 +511,7 @@ function CaseDetail() {
   );
 }
 
-function Field({ label, value, sub }: { label: string; value: string; sub?: string }) {
+function Field({ label, value, sub }: { label: string; value: string; sub?: string | undefined }) {
   return (
     <div>
       <p className="text-xs uppercase tracking-wide text-muted-foreground">{label}</p>

@@ -133,7 +133,7 @@ function SettingsPage() {
                 min={30}
                 max={95}
                 step={1}
-                onValueChange={([v]) => setDraft({ ...draft, aiConfidenceThreshold: v })}
+                onValueChange={([v]) => setDraft({ ...draft, aiConfidenceThreshold: v ?? draft.aiConfidenceThreshold })}
               />
             </CardContent>
           </Card>
