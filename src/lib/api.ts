@@ -1,21 +1,9 @@
 /**
- * Mock API layer for RecoverAI.
- *
- * Every function here mirrors a future backend endpoint (FastAPI / Supabase):
- *
- *   GET  /api/dashboard
- *   GET  /api/transactions
- *   GET  /api/recovery-cases
- *   POST /api/recovery-cases/:id/analyze
- *   POST /api/recovery-cases/:id/execute
- *   POST /api/recovery-cases/:id/escalate
- *   POST /api/recovery-cases/:id/stop
- *   POST /api/recovery-cases/:id/payment-link
- *   GET  /api/audit
- *
- * Swapping to a real backend only requires replacing the bodies below with
- * fetch() calls — the UI never touches raw data directly.
+ * Real API layer for RecoverAI.
+ * Connects directly to FastAPI backend (http://localhost:8000)
+ * with robust local cache & fallback.
  */
+
 import {
   auditTrail as seedAudit,
   customers as seedCustomers,
@@ -27,6 +15,7 @@ import {
   recoveryRateSeries,
   transactions as seedTransactions,
 } from "@/data/mock";
+import { apiClient } from "@/lib/api-client";
 import type {
   AuditEntry,
   Customer,
@@ -42,6 +31,7 @@ export interface AppState {
   audit: AuditEntry[];
   settings: Settings;
   authenticated: boolean;
+  isBackendConnected: boolean;
 }
 
 const clone = <T,>(value: T): T => JSON.parse(JSON.stringify(value)) as T;
@@ -53,6 +43,7 @@ let state: AppState = {
   audit: clone(seedAudit),
   settings: { ...defaultSettings },
   authenticated: false,
+  isBackendConnected: false,
 };
 
 const listeners = new Set<() => void>();
@@ -71,34 +62,138 @@ export function getState() {
   return state;
 }
 
-const nowIso = () => new Date().toISOString();
-let auditSeq = 7800;
+// ----------------------------------------------------------------------
+// Backend Model Mappers
+// ----------------------------------------------------------------------
+function mapCase(c: any): RecoveryCase {
+  const caseId = c.case_id || c.caseId || c.id;
+  const rawTimeline = Array.isArray(c.timeline) ? c.timeline : [];
+  const timeline = rawTimeline.map((t: any) => ({
+    at: t.at || t.created_at || new Date().toISOString(),
+    label: t.label || t.event || "Event",
+    detail: t.detail || t.result || "",
+    kind: (t.kind === "ai" || t.kind === "human" || t.kind === "system" ? t.kind : "system") as "ai" | "human" | "system",
+  }));
 
-function addAudit(
-  entry: Omit<AuditEntry, "id" | "timestamp"> & { timestamp?: string },
-): AuditEntry {
+  const aiReasoning = Array.isArray(c.aiReasoning)
+    ? c.aiReasoning
+    : c.ai_reason
+      ? [c.ai_reason]
+      : [];
+
   return {
-    id: `AUD-${++auditSeq}`,
-    timestamp: entry.timestamp ?? nowIso(),
-    caseId: entry.caseId,
-    event: entry.event,
-    decision: entry.decision,
-    action: entry.action,
-    result: entry.result,
-    actor: entry.actor,
+    id: caseId,
+    customerId: c.customer_id || c.customerId || "",
+    customerName: c.customer_name || c.customerName || "Customer",
+    transactionId: c.transaction_id || c.transactionId || "",
+    amount: Number(c.amount || 0),
+    problem: (c.problem_type || c.problem || "Payment Failed") as any,
+    failureReason: c.ai_reason || c.failureReason || c.failure_reason || "",
+    probability: Number(c.recovery_probability ?? c.probability ?? 0),
+    priority: (c.priority || "Medium") as any,
+    status: (c.status || "Detected") as any,
+    attempts: Number(c.attempts || 0),
+    contacts: Number(c.contacts || 0),
+    createdAt: c.created_at || c.createdAt || new Date().toISOString(),
+    method: c.method || c.payment_method || "Payment Link",
+    aiDecision: (c.ai_decision || c.aiDecision || "Pending Analysis") as any,
+    aiReasoning,
+    recommendedAction: (c.recommended_action || c.recommendedAction || "Send Smart Payment Link") as any,
+    paymentLink: c.payment_link || c.paymentLink || undefined,
+    timeline,
   };
 }
 
-function updateCase(id: string, updater: (c: RecoveryCase) => RecoveryCase, audit: AuditEntry[]) {
-  const cases = state.cases.map((c) => (c.id === id ? updater(c) : c));
-  commit({ ...state, cases, audit: [...audit, ...state.audit] });
-  return cases.find((c) => c.id === id)!;
+function mapTransaction(tx: any): Transaction {
+  return {
+    id: tx.transaction_id || tx.id,
+    customerId: tx.customer_id || tx.customerId || "",
+    customerName: tx.customerName || tx.customer_name || "Unknown",
+    amount: Number(tx.amount || 0),
+    method: tx.payment_method || tx.method || "Card/UPI",
+    date: tx.created_at || tx.date || new Date().toISOString(),
+    status: (tx.status || "Failed") as any,
+    failureReason: tx.failure_reason || tx.failureReason || null,
+    recoveryStatus: tx.recovery_status || tx.recoveryStatus || "Not Started",
+  };
 }
+
+function mapCustomer(cust: any): Customer {
+  return {
+    id: cust.id,
+    name: cust.name,
+    email: cust.email,
+    phone: cust.phone || "",
+    city: cust.city || "Mumbai",
+    segment: (cust.segment || "SMB") as any,
+    lifetimeValue: Number(cust.total_revenue || cust.lifetimeValue || 0),
+    totalPayments: Number(cust.total_transactions || cust.totalPayments || 0),
+    failedPayments: Number(cust.failed_payments || cust.failedPayments || 0),
+    recoveredRevenue: Number(cust.recovered_revenue || cust.recoveredRevenue || 0),
+  };
+}
+
+function mapAudit(a: any): AuditEntry {
+  return {
+    id: String(a.id || `AUD-${Math.random().toString(36).slice(2, 7)}`),
+    timestamp: a.created_at || a.timestamp || new Date().toISOString(),
+    caseId: a.case_id || a.caseId || "",
+    event: a.event || "",
+    decision: a.decision || "",
+    action: a.action || "",
+    result: a.result || "",
+    actor: (a.performed_by || a.actor || "AI Agent") as any,
+  };
+}
+
+// ----------------------------------------------------------------------
+// Backend Sync
+// ----------------------------------------------------------------------
+export async function syncWithBackend(): Promise<boolean> {
+  try {
+    const [casesRes, txRes, custRes, auditRes] = await Promise.all([
+      apiClient.getRecoveryCases(),
+      apiClient.getTransactions(),
+      apiClient.getCustomers(),
+      apiClient.getAuditLogs(),
+    ]);
+
+    const mappedCases = Array.isArray(casesRes) ? casesRes.map(mapCase) : state.cases;
+    const mappedTx = Array.isArray(txRes) ? txRes.map(mapTransaction) : state.transactions;
+    const mappedCust = Array.isArray(custRes) ? custRes.map(mapCustomer) : state.customers;
+    const mappedAudit = Array.isArray(auditRes) ? auditRes.map(mapAudit) : state.audit;
+
+    commit({
+      ...state,
+      cases: mappedCases,
+      transactions: mappedTx,
+      customers: mappedCust,
+      audit: mappedAudit,
+      isBackendConnected: true,
+    });
+    return true;
+  } catch (err) {
+    console.warn("[RecoverAI] Backend unreachable; using local cache/seed data.", err);
+    return false;
+  }
+}
+
+// Auto-sync on client load and periodic poll for live webhooks
+if (typeof window !== "undefined") {
+  syncWithBackend();
+  // Poll every 3 seconds for live background webhook updates
+  setInterval(() => {
+    syncWithBackend();
+  }, 3000);
+  window.addEventListener("focus", () => {
+    syncWithBackend();
+  });
+}
+
 
 /* ------------------------------------------------------------------ */
 /* Guardrails                                                          */
 /* ------------------------------------------------------------------ */
-
 export interface GuardrailState {
   attemptsUsed: number;
   maxAttempts: number;
@@ -160,7 +255,6 @@ export function evaluateGuardrails(c: RecoveryCase, settings: Settings): Guardra
 /* ------------------------------------------------------------------ */
 /* Reads                                                               */
 /* ------------------------------------------------------------------ */
-
 export interface DashboardMetrics {
   revenueAtRisk: number;
   revenueRecovered: number;
@@ -203,9 +297,8 @@ export const charts = {
 };
 
 /* ------------------------------------------------------------------ */
-/* Writes                                                              */
+/* Writes & Actions connected to FastAPI Backend                      */
 /* ------------------------------------------------------------------ */
-
 export function login() {
   commit({ ...state, authenticated: true });
 }
@@ -218,37 +311,6 @@ export function updateSettings(patch: Partial<Settings>) {
   commit({ ...state, settings: { ...state.settings, ...patch } });
 }
 
-function buildReasoning(c: RecoveryCase, settings: Settings) {
-  const customer = state.customers.find((x) => x.id === c.customerId);
-  const reasoning: string[] = [];
-  reasoning.push(
-    `The payment of ${formatINR(c.amount)} failed because of: ${c.failureReason.toLowerCase()}.`,
-  );
-  if (customer) {
-    reasoning.push(
-      `${customer.name} has completed ${customer.totalPayments} payments before, with ${customer.failedPayments} failures — this is a ${customer.failedPayments <= 3 ? "reliable" : "moderately risky"} payer.`,
-    );
-  }
-  if (c.problem === "Checkout Abandoned") {
-    reasoning.push("The customer left at the payment step, so a gentle reminder usually works.");
-  } else if (c.problem === "Repeated Failure") {
-    reasoning.push("The same payment has failed more than once, so another silent retry is unlikely to work.");
-  } else {
-    reasoning.push("This looks like a one-off failure that a fresh payment link can fix.");
-  }
-  if (c.amount > settings.highValueThreshold) {
-    reasoning.push(
-      `The amount is above the high-value limit of ${formatINR(settings.highValueThreshold)}, so a human must approve any recovery action.`,
-    );
-  }
-  if (c.attempts >= settings.maxAttempts) {
-    reasoning.push(
-      `${c.attempts} of ${settings.maxAttempts} attempts have already been used, so automatic recovery is switched off.`,
-    );
-  }
-  return reasoning;
-}
-
 export function formatINR(amount: number) {
   return new Intl.NumberFormat("en-IN", {
     style: "currency",
@@ -257,270 +319,80 @@ export function formatINR(amount: number) {
   }).format(amount);
 }
 
-export async function analyzeCase(id: string) {
-  const current = getCase(id);
-  if (!current) throw new Error("Case not found");
-  await delay(900);
-  const settings = state.settings;
-  const reasoning = buildReasoning(current, settings);
-
-  let decision: RecoveryCase["aiDecision"] = "Auto Recovery Approved";
-  let action: RecoveryCase["recommendedAction"] = "Send Smart Payment Link";
-  let status: RecoveryCase["status"] = "Analyzed";
-
-  if (current.attempts >= settings.maxAttempts) {
-    decision = "Recovery Blocked";
-    action = "Stop Recovery";
-    status = "Stopped";
-  } else if (current.amount > settings.highValueThreshold) {
-    decision = "Human Review Required";
-    action = "Escalate to Human Review";
-  } else if (current.probability < settings.aiConfidenceThreshold) {
-    decision = "Human Review Required";
-    action = "Escalate to Human Review";
-  } else if (current.problem === "Checkout Abandoned") {
-    action = "Send Checkout Reminder";
-  } else if (current.failureReason.toLowerCase().includes("3d secure")) {
-    action = "Retry Payment on Backup Method";
+export async function analyzeCase(id: string): Promise<RecoveryCase> {
+  try {
+    await apiClient.analyzeCase(id);
+    await syncWithBackend();
+  } catch (err) {
+    console.warn(`[API] analyzeCase fallback for ${id}:`, err);
   }
-
-  return updateCase(
-    id,
-    (c) => ({
-      ...c,
-      status: c.status === "Recovered" ? c.status : status,
-      aiDecision: decision,
-      aiReasoning: reasoning,
-      recommendedAction: action,
-      timeline: [
-        ...c.timeline,
-        {
-          at: nowIso(),
-          label: "AI Analysed",
-          detail: `Recovery probability ${c.probability}% — ${decision}.`,
-          kind: "ai" as const,
-        },
-      ],
-    }),
-    [
-      addAudit({
-        caseId: id,
-        event: "AI Analysed",
-        decision,
-        action,
-        result: `Probability ${current.probability}%`,
-        actor: "AI Agent",
-      }),
-    ],
-  );
-}
-
-export async function generatePaymentLink(id: string) {
   const current = getCase(id);
   if (!current) throw new Error("Case not found");
-  await delay(700);
-  const link = `https://pay.recoverai.in/${id.toLowerCase()}-${Math.random().toString(36).slice(2, 8)}`;
-  return updateCase(
-    id,
-    (c) => ({
-      ...c,
-      paymentLink: link,
-      contacts: c.contacts + 1,
-      status: c.status === "Recovered" ? c.status : "Recovery Initiated",
-      timeline: [
-        ...c.timeline,
-        {
-          at: nowIso(),
-          label: "Payment Link Generated",
-          detail: "Smart payment link sent to the customer on email and SMS.",
-          kind: "ai" as const,
-        },
-      ],
-    }),
-    [
-      addAudit({
-        caseId: id,
-        event: "Recovery Link Generated",
-        decision: current.aiDecision,
-        action: "Send Smart Payment Link",
-        result: "Link delivered to customer",
-        actor: "AI Agent",
-      }),
-    ],
-  );
+  return current;
 }
 
-export async function executeRecovery(id: string) {
-  const current = getCase(id);
-  if (!current) throw new Error("Case not found");
-  const guard = evaluateGuardrails(current, state.settings);
-  if (guard.recoveryDisabled) {
-    throw new Error(guard.reasons[0] ?? "Recovery is not allowed for this case.");
+export async function generatePaymentLink(id: string): Promise<RecoveryCase> {
+  try {
+    await apiClient.generatePaymentLink(id);
+    await syncWithBackend();
+  } catch (err) {
+    console.warn(`[API] generatePaymentLink fallback for ${id}:`, err);
   }
-  await delay(900);
-  const attempts = current.attempts + 1;
-  const limitHit = attempts >= state.settings.maxAttempts;
-  return updateCase(
-    id,
-    (c) => ({
-      ...c,
-      attempts,
-      contacts: c.contacts + 1,
-      status: limitHit ? "Stopped" : "Recovery Initiated",
-      timeline: [
-        ...c.timeline,
-        {
-          at: nowIso(),
-          label: `Recovery Attempt ${attempts}`,
-          detail: `${c.recommendedAction} executed automatically.`,
-          kind: "ai" as const,
-        },
-        ...(limitHit
-          ? [
-              {
-                at: nowIso(),
-                label: "Recovery Stopped",
-                detail: `Attempt limit ${state.settings.maxAttempts}/${state.settings.maxAttempts} reached — automatic recovery disabled.`,
-                kind: "system" as const,
-              },
-            ]
-          : []),
-      ],
-    }),
-    [
-      addAudit({
-        caseId: id,
-        event: `Recovery Attempt ${attempts}`,
-        decision: current.aiDecision,
-        action: current.recommendedAction,
-        result: limitHit ? "Attempt limit reached — recovery stopped" : "Recovery initiated",
-        actor: "AI Agent",
-      }),
-    ],
-  );
-}
-
-export async function markRecovered(id: string) {
   const current = getCase(id);
   if (!current) throw new Error("Case not found");
-  await delay(800);
-  const transactions = state.transactions.map((t) =>
-    t.id === current.transactionId
-      ? { ...t, status: "Recovered" as const, recoveryStatus: "Recovered by RecoverAI" }
-      : t,
-  );
-  const customers = state.customers.map((cu) =>
-    cu.id === current.customerId
-      ? { ...cu, recoveredRevenue: cu.recoveredRevenue + current.amount }
-      : cu,
-  );
-  const cases = state.cases.map((c) =>
-    c.id === id
-      ? {
-          ...c,
-          status: "Recovered" as const,
-          timeline: [
-            ...c.timeline,
-            {
-              at: nowIso(),
-              label: "Payment Recovered",
-              detail: `${formatINR(c.amount)} collected and verified.`,
-              kind: "system" as const,
-            },
-          ],
-        }
-      : c,
-  );
-  commit({
-    ...state,
-    cases,
-    transactions,
-    customers,
-    audit: [
-      addAudit({
-        caseId: id,
-        event: "Payment Recovered",
-        decision: current.aiDecision,
-        action: current.recommendedAction,
-        result: `${formatINR(current.amount)} recovered`,
-        actor: "System",
-      }),
-      ...state.audit,
-    ],
-  });
-  return cases.find((c) => c.id === id)!;
+  return current;
 }
 
-export async function escalateCase(id: string, note?: string) {
+export async function executeRecovery(id: string): Promise<RecoveryCase> {
+  try {
+    await apiClient.executeRecovery(id);
+    await syncWithBackend();
+  } catch (err) {
+    console.warn(`[API] executeRecovery error for ${id}:`, err);
+    throw err;
+  }
   const current = getCase(id);
   if (!current) throw new Error("Case not found");
-  await delay(600);
-  return updateCase(
-    id,
-    (c) => ({
-      ...c,
-      status: "Escalated",
-      aiDecision: "Human Review Required",
-      timeline: [
-        ...c.timeline,
-        {
-          at: nowIso(),
-          label: "Escalated to Human Review",
-          detail: note?.trim() ? note.trim() : "Case handed to the revenue operations team.",
-          kind: "human" as const,
-        },
-      ],
-    }),
-    [
-      addAudit({
-        caseId: id,
-        event: "Escalated",
-        decision: "Human Review Required",
-        action: "Assign to revenue operations",
-        result: "Awaiting human decision",
-        actor: "Human",
-      }),
-    ],
-  );
+  return current;
 }
 
-export async function stopRecovery(id: string, reason?: string) {
+export async function markRecovered(id: string): Promise<RecoveryCase> {
+  try {
+    await apiClient.markRecovered(id);
+    await syncWithBackend();
+  } catch (err) {
+    console.warn(`[API] markRecovered fallback for ${id}:`, err);
+  }
   const current = getCase(id);
   if (!current) throw new Error("Case not found");
-  await delay(500);
-  return updateCase(
-    id,
-    (c) => ({
-      ...c,
-      status: "Stopped",
-      timeline: [
-        ...c.timeline,
-        {
-          at: nowIso(),
-          label: "Recovery Stopped",
-          detail: reason?.trim() ? reason.trim() : "Recovery stopped manually.",
-          kind: "human" as const,
-        },
-      ],
-    }),
-    [
-      addAudit({
-        caseId: id,
-        event: "Recovery Stopped",
-        decision: "Manual stop",
-        action: "Disable further attempts",
-        result: "No further contact",
-        actor: "Human",
-      }),
-    ],
-  );
+  return current;
 }
 
-export async function refreshData() {
-  await delay(600);
+export async function escalateCase(id: string, note?: string): Promise<RecoveryCase> {
+  try {
+    await apiClient.escalateCase(id, note);
+    await syncWithBackend();
+  } catch (err) {
+    console.warn(`[API] escalateCase fallback for ${id}:`, err);
+  }
+  const current = getCase(id);
+  if (!current) throw new Error("Case not found");
+  return current;
+}
+
+export async function stopRecovery(id: string, reason?: string): Promise<RecoveryCase> {
+  try {
+    await apiClient.stopRecovery(id, reason);
+    await syncWithBackend();
+  } catch (err) {
+    console.warn(`[API] stopRecovery fallback for ${id}:`, err);
+  }
+  const current = getCase(id);
+  if (!current) throw new Error("Case not found");
+  return current;
+}
+
+export async function refreshData(): Promise<void> {
+  await syncWithBackend();
   listeners.forEach((l) => l());
-}
-
-function delay(ms: number) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }

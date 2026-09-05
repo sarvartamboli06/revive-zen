@@ -5,6 +5,7 @@ import {
   Bot,
   CheckCircle2,
   Copy,
+  ExternalLink,
   Link2,
   Loader2,
   Play,
@@ -240,18 +241,33 @@ function CaseDetail() {
               {c.paymentLink && (
                 <div className="flex flex-wrap items-center gap-2 rounded-md bg-info-soft px-3 py-2 text-sm">
                   <Link2 className="size-4 text-info" />
-                  <span className="truncate font-mono text-xs">{c.paymentLink}</span>
-                  <Button
-                    size="sm"
-                    variant="ghost"
-                    className="ml-auto"
-                    onClick={() => {
-                      navigator.clipboard?.writeText(c.paymentLink!);
-                      toast.success("Payment link copied");
-                    }}
+                  <a
+                    href={c.paymentLink}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="max-w-[320px] truncate font-mono text-xs text-primary underline hover:text-primary/80"
                   >
-                    <Copy className="size-3.5" /> Copy
-                  </Button>
+                    {c.paymentLink}
+                  </a>
+                  <div className="ml-auto flex items-center gap-1">
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      onClick={() => window.open(c.paymentLink, "_blank")}
+                    >
+                      <ExternalLink className="size-3.5 mr-1" /> Open
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      onClick={() => {
+                        navigator.clipboard?.writeText(c.paymentLink!);
+                        toast.success("Payment link copied");
+                      }}
+                    >
+                      <Copy className="size-3.5" /> Copy
+                    </Button>
+                  </div>
                 </div>
               )}
 
