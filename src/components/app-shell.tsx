@@ -67,11 +67,24 @@ export function AppShell({
   const alerts =
     state.cases.filter((c) => c.status === "Detected").length + escalated;
 
+  useEffect(() => {
+    if (state.loaded || state.loading) return;
+    void loadAll().catch((err: unknown) => {
+      toast.error("Could not load data", { description: errorMessage(err) });
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   async function onRefresh() {
     setRefreshing(true);
-    await refreshData();
-    setRefreshing(false);
-    toast.success("Data refreshed", { description: "Live recovery signals are up to date." });
+    try {
+      await refreshData();
+      toast.success("Data refreshed", { description: "Live recovery signals are up to date." });
+    } catch (err) {
+      toast.error("Could not refresh data", { description: errorMessage(err) });
+    } finally {
+      setRefreshing(false);
+    }
   }
 
   function onSearch(e: React.FormEvent) {
