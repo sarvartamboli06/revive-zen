@@ -13,7 +13,7 @@ import {
   Sparkles,
   TriangleAlert,
 } from "lucide-react";
-import { useState, type ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { toast } from "sonner";
 import { AppShell } from "@/components/app-shell";
 import { PriorityBadge, ProbabilityBar, StatusBadge, formatINR } from "@/components/bits";
@@ -37,6 +37,7 @@ import {
   evaluateGuardrails,
   executeRecovery,
   generatePaymentLink,
+  loadCase,
   markRecovered,
   stopRecovery,
 } from "@/lib/api";
@@ -71,11 +72,24 @@ function CaseDetail() {
   const [pending, setPending] = useState<Pending>(null);
   const [confirm, setConfirm] = useState<Pending>(null);
 
+  useEffect(() => {
+    void loadCase(caseId).catch(() => null);
+  }, [caseId]);
+
   const c = state.cases.find((x) => x.id === caseId);
   const customer = state.customers.find((x) => x.id === c?.customerId);
   const audit = state.audit.filter((a) => a.caseId === caseId);
 
   if (!c) {
+    if (state.loading || !state.loaded) {
+      return (
+        <AppShell title="Loading case…" subtitle="Fetching the latest recovery data">
+          <div className="flex items-center gap-2 rounded-lg border border-border bg-card px-4 py-10 text-sm text-muted-foreground">
+            <Loader2 className="size-4 animate-spin" /> Loading case {caseId}…
+          </div>
+        </AppShell>
+      );
+    }
     return (
       <AppShell title="Case not found">
         <Button asChild variant="outline">

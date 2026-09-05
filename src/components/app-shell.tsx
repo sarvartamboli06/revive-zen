@@ -17,7 +17,7 @@ import {
   Users,
   X,
 } from "lucide-react";
-import { useState, type ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -30,7 +30,7 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import { logout, refreshData } from "@/lib/api";
+import { errorMessage, loadAll, logout, refreshData } from "@/lib/api";
 import { useAppState } from "@/lib/store";
 import { cn } from "@/lib/utils";
 
@@ -67,11 +67,24 @@ export function AppShell({
   const alerts =
     state.cases.filter((c) => c.status === "Detected").length + escalated;
 
+  useEffect(() => {
+    if (state.loaded || state.loading) return;
+    void loadAll().catch((err: unknown) => {
+      toast.error("Could not load data", { description: errorMessage(err) });
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   async function onRefresh() {
     setRefreshing(true);
-    await refreshData();
-    setRefreshing(false);
-    toast.success("Data refreshed", { description: "Live recovery signals are up to date." });
+    try {
+      await refreshData();
+      toast.success("Data refreshed", { description: "Live recovery signals are up to date." });
+    } catch (err) {
+      toast.error("Could not refresh data", { description: errorMessage(err) });
+    } finally {
+      setRefreshing(false);
+    }
   }
 
   function onSearch(e: React.FormEvent) {
@@ -258,7 +271,22 @@ export function AppShell({
             </div>
             {actions && <div className="flex flex-wrap gap-2">{actions}</div>}
           </div>
-          {children}
+          {state.error && (
+            <div className="mb-4 flex items-start gap-2 rounded-lg border border-destructive/30 bg-destructive/5 px-4 py-3 text-sm text-destructive">
+              <AlertTriangle className="mt-0.5 size-4 shrink-0" />
+              <div>
+                <p className="font-medium">Backend not reachable</p>
+                <p className="text-destructive/80">{state.error}</p>
+              </div>
+            </div>
+          )}
+          {state.loading && !state.loaded ? (
+            <div className="flex items-center gap-2 rounded-lg border border-border bg-card px-4 py-10 text-sm text-muted-foreground">
+              <RefreshCw className="size-4 animate-spin" /> Loading live recovery data…
+            </div>
+          ) : (
+            children
+          )}
         </main>
       </div>
     </div>
